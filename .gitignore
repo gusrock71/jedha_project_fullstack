@@ -1,0 +1,22 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Données et outputs lourds
+outputs/data/*.csv
+outputs/models/*.pkl
+outputs/models/*.joblib
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

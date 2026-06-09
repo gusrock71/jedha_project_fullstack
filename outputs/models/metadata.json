@@ -1,0 +1,80 @@
+{
+  "AF": {
+    "target": "AF_Return",
+    "best_lags": {
+      "GPRD_ACT_Diff": 3,
+      "GPRD_THREAT_Diff": 2,
+      "CLI_Diff": 9,
+      "STOXX_Return": 0,
+      "VIX_Return": 0,
+      "Brent_Return": 0
+    },
+    "features": [
+      "GPRD_ACT_Diff_lag3",
+      "GPRD_THREAT_Diff_lag2",
+      "CLI_Diff_lag9",
+      "STOXX_Return_lag0",
+      "VIX_Return_lag0",
+      "Brent_Return_lag0"
+    ],
+    "metrics": {
+      "acc": 0.7051,
+      "auc": 0.8211,
+      "f1": 0.6807,
+      "prec": 0.5469,
+      "rec": 0.901
+    }
+  },
+  "TTE": {
+    "target": "TTE_Return",
+    "best_lags": {
+      "GPRD_ACT_Diff": 13,
+      "GPRD_THREAT_Diff": 27,
+      "CLI_Diff": 8,
+      "STOXX_Return": 0,
+      "VIX_Return": 0,
+      "Brent_Return": 0
+    },
+    "features": [
+      "GPRD_ACT_Diff_lag13",
+      "GPRD_THREAT_Diff_lag27",
+      "CLI_Diff_lag8",
+      "STOXX_Return_lag0",
+      "VIX_Return_lag0",
+      "Brent_Return_lag0"
+    ],
+    "metrics": {
+      "acc": 0.7591,
+      "auc": 0.8534,
+      "f1": 0.7287,
+      "prec": 0.6432,
+      "rec": 0.8403
+    }
+  },
+  "RNO": {
+    "target": "RNO_Return",
+    "best_lags": {
+      "GPRD_ACT_Diff": 7,
+      "GPRD_THREAT_Diff": 11,
+      "CLI_Diff": 14,
+      "STOXX_Return": 0,
+      "VIX_Return": 0,
+      "Brent_Return": 0
+    },
+    "features": [
+      "GPRD_ACT_Diff_lag7",
+      "GPRD_THREAT_Diff_lag11",
+      "CLI_Diff_lag14",
+      "STOXX_Return_lag0",
+      "VIX_Return_lag0",
+      "Brent_Return_lag0"
+    ],
+    "metrics": {
+      "acc": 0.7481,
+      "auc": 0.8499,
+      "f1": 0.7187,
+      "prec": 0.6083,
+      "rec": 0.8782
+    }
+  }
+}
