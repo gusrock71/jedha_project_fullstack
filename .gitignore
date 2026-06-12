@@ -6,9 +6,9 @@ __pycache__/
 .env
 
 # Données et outputs lourds
-outputs/data/*.csv
-outputs/models/*.pkl
-outputs/models/*.joblib
+outputs/df_combined.csv
+outputs/figures/
+data/raw/OECD_SDD_STES_DSD_STES_DF_CLI__all.csv
 
 # Jupyter
 .ipynb_checkpoints/
