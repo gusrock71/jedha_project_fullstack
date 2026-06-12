@@ -10,6 +10,8 @@ license: mit
 short_description: Prédiction de tendance boursière (AF, TTE, RNO) — Projet Jedha
 ---
 
+🚀 **Démo en ligne** : [huggingface.co/spaces/gusrock71/jedha-project-fullstack](https://huggingface.co/spaces/gusrock71/jedha-project-fullstack)
+
 # Impact des variations d'indices macroéconomiques, financiers et géopolitiques sur les rendements de certaines valeurs boursières françaises
 
 **Projet de fin d'études — Jedha Bootcamp**
