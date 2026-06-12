@@ -19,6 +19,14 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 
+# Fix "database is locked" : le cache SQLite par défaut de yfinance pointe
+# vers un répertoire non-writable dans les conteneurs Docker (HF Spaces).
+# On le redirige vers /tmp qui est toujours accessible en écriture.
+try:
+    yf.set_tz_cache_location("/tmp/yfinance_cache")
+except Exception:
+    pass
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -90,22 +98,47 @@ def load_model(asset: str, model_type_key: str):
     return None
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=21600)   # cache 6h — limite l'exposition au rate limiting Yahoo Finance
 def load_live_prices(days: int = 60):
-    """Télécharge les prix récents via yfinance."""
+    """
+    Télécharge les prix récents via yfinance, avec retries en cas de
+    rate limiting (YFRateLimitError) ou d'échec de téléchargement.
+    """
+    import time
+
     end   = datetime.today()
     start = end - timedelta(days=days)
-
     tickers = list(TICKERS_LIVE.keys())
-    raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+
+    raw = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+            # Si certaines colonnes sont entièrement vides, on retente
+            missing = [t for t in tickers if t not in raw.columns or raw[t].dropna().empty]
+            if not missing:
+                break
+            last_err = f"Tickers vides : {missing}"
+        except Exception as e:
+            last_err = str(e)
+            raw = None
+        time.sleep(2 * (attempt + 1))  # backoff progressif (2s, 4s, 6s)
+
+    if raw is None:
+        raise RuntimeError(f"Téléchargement Yahoo Finance impossible : {last_err}")
+
     raw.rename(columns=TICKERS_LIVE, inplace=True)
 
     # Comble les trous ponctuels (ex: jour férié sur un seul marché)
     raw = raw.ffill().bfill()
 
+    # Colonnes encore entièrement vides après ffill/bfill (échec persistant)
+    empty_cols = [c for c in raw.columns if raw[c].isna().all()]
+
     # Log-returns — dropna uniquement sur les lignes entièrement vides
     returns = np.log(raw / raw.shift(1)).dropna(how="all")
-    return raw, returns
+    return raw, returns, empty_cols
 
 
 @st.cache_data(ttl=86400)   # cache 24h — données mises à jour mensuellement
@@ -204,13 +237,20 @@ def build_live_features(
     best_lags: dict,
     df_gpr: pd.DataFrame | None = None,
     cli_diff: float = 0.0,
+    empty_cols: list | None = None,
 ) -> pd.DataFrame:
     """
     Construit les features laggées à partir des données live.
     - STOXX, VIX, Brent  → Yahoo Finance (temps réel)
     - GPRD_ACT, GPRD_THREAT → matteoiacoviello.com si disponible, sinon 0
     - CLI_Diff → valeur saisie manuellement par l'administrateur (défaut 0)
+
+    Si une colonne Yahoo Finance (STOXX/VIX/Brent) est entièrement vide
+    (échec de téléchargement, rate limiting), la feature correspondante
+    est fixée à 0 plutôt que de faire échouer dropna() sur tout le dataset.
     """
+    empty_cols = empty_cols or []
+
     feature_map = {
         "STOXX_Return":     "STOXX",
         "VIX_Return":       "VIX",
@@ -226,9 +266,13 @@ def build_live_features(
         col_name = f"{feat}_lag{lag}"
         src_col  = feature_map.get(feat)
 
-        if src_col and src_col in returns.columns:
+        if src_col and src_col in returns.columns and src_col not in empty_cols:
             # Feature Yahoo Finance
             df[col_name] = returns[src_col].shift(lag)
+
+        elif src_col and src_col in empty_cols:
+            # Téléchargement échoué pour ce ticker — valeur neutre
+            df[col_name] = 0.0
 
         elif feat in ("GPRD_ACT_Diff", "GPRD_THREAT_Diff") and df_gpr is not None:
             # Feature GPR live
@@ -276,11 +320,11 @@ def load_common_data(asset: str, seuil: float, cli_diff: float = 0.0):
 
     with st.spinner("Chargement des données de marché..."):
         try:
-            prices, returns = load_live_prices(days=90)
+            prices, returns, empty_cols = load_live_prices(days=90)
             data_ok = True
         except Exception:
             data_ok = False
-            prices, returns = None, None
+            prices, returns, empty_cols = None, None, []
 
     with st.spinner("Chargement GPR (Caldara & Iacoviello)..."):
         df_gpr = load_gpr_live()
@@ -290,7 +334,14 @@ def load_common_data(asset: str, seuil: float, cli_diff: float = 0.0):
         st.warning("Impossible de télécharger les données de marché en direct.")
         return None
 
-    features_df = build_live_features(returns, best_lags, df_gpr=df_gpr, cli_diff=cli_diff)
+    if empty_cols:
+        st.warning(
+            f"⚠️ Yahoo Finance n'a pas pu fournir de données pour : {', '.join(empty_cols)} "
+            f"(rate limiting ou indisponibilité temporaire). Ces variables sont fixées à 0 "
+            f"pour cette prédiction — la fiabilité du signal peut être réduite."
+        )
+
+    features_df = build_live_features(returns, best_lags, df_gpr=df_gpr, cli_diff=cli_diff, empty_cols=empty_cols)
     if len(features_df) == 0:
         st.error("Pas assez de données pour calculer les features.")
 
@@ -353,11 +404,45 @@ def render_price_probability_chart(asset: str, asset_label: str, data: dict, seu
     df_probas = pd.DataFrame(probas).set_index("date")
 
     if yf_col not in prices.columns:
-        st.warning("Données de prix indisponibles pour cet actif.")
+        st.warning(f"Données de prix indisponibles pour {asset} (colonne '{yf_col}' absente).")
         return df_probas
 
     prix_30 = prices[yf_col].reindex(df_probas.index, method="ffill").dropna()
-    dates   = prix_30.index
+
+    if prix_30.empty:
+        st.warning(
+            f"Le téléchargement du prix de {asset_label} a échoué pour la période affichée "
+            f"(Yahoo Finance). Seules les probabilités sont affichées ci-dessous."
+        )
+        plt.close("all")
+        fig, ax2 = plt.subplots(figsize=(13, 5))
+        fig.patch.set_facecolor("#1e2530")
+        ax2.set_facecolor("#1e2530")
+
+        dates = df_probas.index
+        colors_bar = ["#4caf50" if p >= seuil else "#ef5350" for p in df_probas["proba"].values]
+        ax2.bar(dates, df_probas["proba"].values, color=colors_bar, alpha=0.7, width=0.8)
+        ax2.axhline(seuil, color="white", linestyle="--", linewidth=1.2, label=f"Seuil ({seuil:.0%})")
+        ax2.set_ylabel("Probabilité de hausse", color="white", fontsize=11)
+        ax2.tick_params(axis="y", colors="white")
+        ax2.tick_params(axis="x", colors="white")
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax2.set_ylim(0, 1.1)
+        for spine in ax2.spines.values():
+            spine.set_edgecolor("#333")
+        ax2.legend(facecolor="#1e2530", labelcolor="white", loc="upper left", fontsize=9)
+        ax2.set_title(f"{asset_label} — Probabilité de hausse (30 derniers jours)",
+                       fontsize=12, color="white", pad=12)
+        plt.xticks(rotation=30)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+        return df_probas
+
+    dates = prix_30.index
+
+    # Sécurité : éviter qu'une figure précédente reste active
+    plt.close("all")
 
     fig, ax1 = plt.subplots(figsize=(13, 5))
     fig.patch.set_facecolor("#1e2530")
@@ -418,8 +503,15 @@ def render_public_page():
     st.title("📈 Tendance du marché")
     st.caption("Prédiction de la tendance du lendemain pour Air France, TotalEnergies et Renault")
 
-    # Sélecteur d'actif simple, pas de sidebar
-    asset_label = st.selectbox("Choisissez un actif", list(ASSETS.keys()))
+    # Sélecteur d'actif simple, pas de sidebar (synchronisé avec la page paramètres)
+    asset_keys = list(ASSETS.keys())
+    asset_label = st.selectbox(
+        "Choisissez un actif",
+        asset_keys,
+        index=asset_keys.index(st.session_state.selected_asset),
+        key="asset_selector_public",
+    )
+    st.session_state.selected_asset = asset_label
     asset = ASSETS[asset_label]
 
     seuil = 0.40  # seuil par défaut, non modifiable côté public
@@ -489,13 +581,21 @@ def render_settings_page():
     render_logo()
     st.title("⚙️ Paramètres avancés")
 
+    # Même sélecteur d'actif que sur la page publique (état partagé)
+    asset_keys = list(ASSETS.keys())
+    asset_label = st.selectbox(
+        "Choisissez un actif",
+        asset_keys,
+        index=asset_keys.index(st.session_state.selected_asset),
+        key="asset_selector_settings",
+    )
+    st.session_state.selected_asset = asset_label
+    asset = ASSETS[asset_label]
+
     # ------------------------------------------------------------------
     # Sidebar
     # ------------------------------------------------------------------
     st.sidebar.title("⚙️ Paramètres")
-
-    asset_label = st.sidebar.selectbox("Actif", list(ASSETS.keys()))
-    asset       = ASSETS[asset_label]
 
     best_model_info = BEST_MODEL_BY_ASSET[asset]
     model_label     = best_model_info["label"]
@@ -658,6 +758,10 @@ def main():
     # Initialisation de la page courante
     if "page" not in st.session_state:
         st.session_state.page = "public"
+
+    # Initialisation de l'actif sélectionné (partagé entre les deux pages)
+    if "selected_asset" not in st.session_state:
+        st.session_state.selected_asset = list(ASSETS.keys())[0]
 
     # Bouton de navigation en haut à droite
     col_nav1, col_nav2 = st.columns([6, 1])
