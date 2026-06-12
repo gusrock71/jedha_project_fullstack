@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 
 MODELS_DIR   = "outputs/models"
 META_PATH    = os.path.join(MODELS_DIR, "metadata.json")
+LOGO_PATH    = "assets/jedha_logo.png"
 
 ASSETS = {
     "Air France (AF)":        "AF",
@@ -64,6 +65,12 @@ TICKERS_LIVE = {
 # =============================================================================
 # CHARGEMENT
 # =============================================================================
+
+def render_logo():
+    """Affiche le logo Jedha en haut de page."""
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=200)
+
 
 @st.cache_resource
 def load_metadata():
@@ -156,6 +163,48 @@ def load_gpr_live() -> pd.DataFrame | None:
         return None
 
 
+@st.cache_data(ttl=86400)   # cache 24h — données mensuelles
+def load_cli_live() -> dict | None:
+    """
+    Récupère automatiquement les deux dernières valeurs CLI (G4E, mensuel,
+    indice IX, ajustement AA) via l'API SDMX de l'OCDE.
+
+    Retourne {"prev": float, "curr": float, "diff": float,
+              "prev_date": str, "curr_date": str} ou None si échec.
+    """
+    URL = (
+        "https://sdmx.oecd.org/public/rest/data/"
+        "OECD.SDD.STES,DSD_STES@DF_CLI/G4E.M.LI.._Z.AA.IX._Z.H"
+        "?format=csvfilewithlabels"
+    )
+
+    try:
+        import requests, io
+        resp = requests.get(URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+
+        df = pd.read_csv(io.StringIO(resp.text))
+        df = df[["TIME_PERIOD", "OBS_VALUE"]].dropna()
+        df["TIME_PERIOD"] = pd.to_datetime(df["TIME_PERIOD"])
+        df = df.sort_values("TIME_PERIOD")
+
+        if len(df) < 2:
+            return None
+
+        prev_row = df.iloc[-2]
+        curr_row = df.iloc[-1]
+
+        return {
+            "prev":      float(prev_row["OBS_VALUE"]),
+            "curr":      float(curr_row["OBS_VALUE"]),
+            "diff":      round(float(curr_row["OBS_VALUE"]) - float(prev_row["OBS_VALUE"]), 6),
+            "prev_date": prev_row["TIME_PERIOD"].strftime("%Y-%m"),
+            "curr_date": curr_row["TIME_PERIOD"].strftime("%Y-%m"),
+        }
+    except Exception:
+        return None
+
+
 # =============================================================================
 # FEATURE BUILDING
 # =============================================================================
@@ -207,18 +256,385 @@ def build_live_features(
 
 
 # =============================================================================
-# PAGE PRINCIPALE
+# CHARGEMENT COMMUN (utilisé par les deux pages)
+# =============================================================================
+
+def load_common_data(asset: str, seuil: float, cli_diff: float = 0.0):
+    """
+    Charge modèle, métadonnées, données live et construit les features.
+    Retourne un dict avec tout le nécessaire pour l'affichage, ou None si erreur.
+    """
+    metadata = load_metadata()
+    if metadata is None:
+        st.error(
+            "⚠️ Fichier `outputs/models/metadata.json` introuvable. "
+            "Lance d'abord `python3 multi_asset_experiment.py` pour générer les modèles."
+        )
+        return None
+
+    best_model_info = BEST_MODEL_BY_ASSET[asset]
+    model_label     = best_model_info["label"]
+    model_key       = best_model_info["key"]
+
+    model = load_model(asset, model_key)
+    if model is None:
+        st.error(f"⚠️ Modèle introuvable pour {asset} / {model_label}. Vérifiez `outputs/models/`.")
+        return None
+
+    meta      = metadata[asset]
+    best_lags = meta["best_lags"]
+
+    with st.spinner("Chargement des données de marché..."):
+        try:
+            prices, returns = load_live_prices(days=90)
+            data_ok = True
+        except Exception:
+            data_ok = False
+            prices, returns = None, None
+
+    with st.spinner("Chargement GPR (Caldara & Iacoviello)..."):
+        df_gpr = load_gpr_live()
+    gpr_ok = df_gpr is not None
+
+    if not data_ok:
+        st.warning("Impossible de télécharger les données de marché en direct.")
+        return None
+
+    features_df = build_live_features(returns, best_lags, df_gpr=df_gpr, cli_diff=cli_diff)
+    if len(features_df) == 0:
+        st.error("Pas assez de données pour calculer les features.")
+        return None
+
+    feature_cols = list(features_df.columns)
+    last_row     = features_df.iloc[[-1]][feature_cols]
+    proba        = model.predict_proba(last_row)[0][1]
+    signal       = "HAUSSE" if proba >= seuil else "BAISSE"
+    last_date    = features_df.index[-1].strftime("%d/%m/%Y")
+    next_date    = (features_df.index[-1] + timedelta(days=1)).strftime("%d/%m/%Y")
+
+    return {
+        "metadata":     metadata,
+        "meta":         meta,
+        "best_lags":    best_lags,
+        "model":        model,
+        "model_label":  model_label,
+        "prices":       prices,
+        "returns":      returns,
+        "features_df":  features_df,
+        "feature_cols": feature_cols,
+        "proba":        proba,
+        "signal":       signal,
+        "last_date":    last_date,
+        "next_date":    next_date,
+        "gpr_ok":       gpr_ok,
+    }
+
+
+def render_price_probability_chart(asset: str, asset_label: str, data: dict, seuil: float):
+    """Graphique combiné prix + probabilités sur 30 jours (axe double)."""
+    model        = data["model"]
+    features_df  = data["features_df"]
+    feature_cols = data["feature_cols"]
+    prices       = data["prices"]
+
+    asset_ticker_map = {"AF": "AF", "TTE": "TTE", "RNO": "RNO"}
+    yf_col = asset_ticker_map.get(asset, asset)
+
+    # Calcul des probabilités sur les 30 derniers jours
+    n_days = min(30, len(features_df))
+    probas = []
+    for i in range(n_days):
+        idx = -(n_days - i)
+        row = features_df.iloc[idx][feature_cols]
+        p   = model.predict_proba(row.values.reshape(1, -1))[0][1]
+        probas.append({"date": features_df.index[idx], "proba": p})
+    df_probas = pd.DataFrame(probas).set_index("date")
+
+    if yf_col not in prices.columns:
+        st.warning("Données de prix indisponibles pour cet actif.")
+        return df_probas
+
+    prix_30 = prices[yf_col].reindex(df_probas.index, method="ffill").dropna()
+    dates   = prix_30.index
+
+    fig, ax1 = plt.subplots(figsize=(13, 5))
+    fig.patch.set_facecolor("#1e2530")
+    ax1.set_facecolor("#1e2530")
+
+    # Axe gauche — Prix
+    ax1.plot(dates, prix_30.values, color="#4fc3f7",
+             linewidth=2, label=f"Prix {asset}", zorder=3)
+    ax1.fill_between(dates, prix_30.values, prix_30.min(),
+                     alpha=0.08, color="#4fc3f7")
+    ax1.set_ylabel("Prix (€)", color="#4fc3f7", fontsize=11)
+    ax1.tick_params(axis="y", colors="#4fc3f7")
+    ax1.tick_params(axis="x", colors="white")
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    plt.xticks(rotation=30)
+    for spine in ax1.spines.values():
+        spine.set_edgecolor("#333")
+
+    # Axe droit — Probabilités
+    ax2 = ax1.twinx()
+    probas_aligned = df_probas["proba"].reindex(dates, method="ffill")
+    colors_bar = ["#4caf50" if p >= seuil else "#ef5350"
+                  for p in probas_aligned.values]
+
+    ax2.bar(dates, probas_aligned.values, color=colors_bar,
+            alpha=0.45, width=0.8, label="Proba hausse", zorder=2)
+    ax2.axhline(seuil, color="white", linestyle="--",
+                linewidth=1.2, label=f"Seuil ({seuil:.0%})", zorder=4)
+    ax2.set_ylabel("Probabilité de hausse", color="white", fontsize=11)
+    ax2.tick_params(axis="y", colors="white")
+    ax2.set_ylim(0, 1.4)
+
+    # Légende unifiée
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2,
+               facecolor="#1e2530", labelcolor="white",
+               loc="upper left", fontsize=9)
+
+    ax1.set_title(
+        f"{asset_label} — Prix de clôture & Probabilité de hausse (30 derniers jours)",
+        fontsize=12, color="white", pad=12,
+    )
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close()
+
+    return df_probas
+
+
+# =============================================================================
+# PAGE 1 — GRAND PUBLIC
+# =============================================================================
+
+def render_public_page():
+    render_logo()
+    st.title("📈 Tendance du marché")
+    st.caption("Prédiction de la tendance du lendemain pour Air France, TotalEnergies et Renault")
+
+    # Sélecteur d'actif simple, pas de sidebar
+    asset_label = st.selectbox("Choisissez un actif", list(ASSETS.keys()))
+    asset = ASSETS[asset_label]
+
+    seuil = 0.40  # seuil par défaut, non modifiable côté public
+
+    # CLI récupéré automatiquement (silencieux côté grand public)
+    cli_live = load_cli_live()
+    cli_diff = cli_live["diff"] if cli_live is not None else 0.0
+
+    data = load_common_data(asset, seuil, cli_diff=cli_diff)
+    if data is None:
+        return
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # SIGNAL DU JOUR — gros affichage central
+    # ------------------------------------------------------------------
+    signal    = data["signal"]
+    proba     = data["proba"]
+    last_date = data["last_date"]
+    next_date = data["next_date"]
+
+    col_left, col_center, col_right = st.columns([1, 2, 1])
+    with col_center:
+        st.markdown(f"<p style='text-align:center; color:#999; margin-bottom:0;'>Tendance prévue pour le {next_date} (basée sur les données du {last_date})</p>", unsafe_allow_html=True)
+
+        if signal == "HAUSSE":
+            st.markdown(
+                f"<p style='text-align:center; font-size:4rem; font-weight:bold; "
+                f"color:#4caf50; margin:0.5rem 0;'>▲ HAUSSE</p>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<p style='text-align:center; font-size:4rem; font-weight:bold; "
+                f"color:#ef5350; margin:0.5rem 0;'>▼ BAISSE</p>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown(
+            f"<p style='text-align:center; color:#ccc; font-size:1.1rem;'>"
+            f"Probabilité de hausse estimée : <b>{proba:.0%}</b></p>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # GRAPHIQUE PRIX + PROBABILITÉS
+    # ------------------------------------------------------------------
+    render_price_probability_chart(asset, asset_label, data, seuil)
+
+    df_probas = data["features_df"]  # juste pour compatibilité, non utilisé ici
+
+    st.divider()
+    st.caption(
+        "⚠️ **Avertissement** : Ces prédictions sont issues d'un modèle académique "
+        "et ne constituent pas des conseils en investissement."
+    )
+
+
+# =============================================================================
+# PAGE 2 — PARAMÈTRES (toutes les fonctions avancées)
+# =============================================================================
+
+def render_settings_page():
+    render_logo()
+    st.title("⚙️ Paramètres avancés")
+
+    # ------------------------------------------------------------------
+    # Sidebar
+    # ------------------------------------------------------------------
+    st.sidebar.title("⚙️ Paramètres")
+
+    asset_label = st.sidebar.selectbox("Actif", list(ASSETS.keys()))
+    asset       = ASSETS[asset_label]
+
+    best_model_info = BEST_MODEL_BY_ASSET[asset]
+    model_label     = best_model_info["label"]
+
+    st.sidebar.markdown(f"**Modèle retenu** : {model_label}")
+    st.sidebar.caption("Sélection basée sur AUC et F1 out-of-sample")
+
+    seuil = st.sidebar.slider(
+        "Seuil de décision",
+        min_value = 0.30,
+        max_value = 0.70,
+        value     = 0.40,
+        step      = 0.05,
+        help      = "Probabilité minimale pour déclencher un signal HAUSSE"
+    )
+
+    st.sidebar.markdown("---")
+
+    # CLI — récupération automatique OCDE (silencieux, non affiché)
+    cli_live = load_cli_live()
+    cli_diff = cli_live["diff"] if cli_live is not None else 0.0
+
+    st.sidebar.markdown("---")
+
+    # Tableau récapitulatif des meilleurs modèles
+    st.sidebar.markdown("**Meilleurs modèles par actif**")
+    df_best = pd.DataFrame([
+        {"Actif": k, "Modèle": v["label"], "AUC": v["auc"], "F1": v["f1"]}
+        for k, v in BEST_MODEL_BY_ASSET.items()
+    ])
+    st.sidebar.dataframe(df_best, hide_index=True, use_container_width=True)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**À propos**")
+    st.sidebar.markdown(
+        "Projet Jedha — Prédiction des probabilité de hausse de certaines "
+        "valeurs boursières du CAC40 (AF, TTE, RNO) en fonction des "
+        "variations d'indices macroéconomiques, financiers et géopolitiques."
+    )
+
+    # ------------------------------------------------------------------
+    # Chargement des données
+    # ------------------------------------------------------------------
+    data = load_common_data(asset, seuil, cli_diff=cli_diff)
+    if data is None:
+        return
+
+    meta         = data["meta"]
+    best_lags    = data["best_lags"]
+    features_df  = data["features_df"]
+    feature_cols = data["feature_cols"]
+    proba        = data["proba"]
+    signal       = data["signal"]
+    last_date    = data["last_date"]
+    gpr_ok       = data["gpr_ok"]
+
+    # ------------------------------------------------------------------
+    # Statut des sources de données
+    # ------------------------------------------------------------------
+    sources = []
+    sources.append("✅ Yahoo Finance (STOXX, VIX, Brent)")
+    sources.append("✅ GPR live — data_gpr_daily_recent.xls (Caldara & Iacoviello)" if gpr_ok else "⚠️ GPR indisponible → fixé à 0")
+    sources.append(f"✅ CLI (diff = {cli_diff:+.4f})" if cli_diff != 0.0 else "⚠️ CLI_Diff = 0")
+    st.caption(f"Actif : **{asset_label}**  |  Modèle : **{model_label}**  |  Seuil : **{seuil}**  |  " + "  |  ".join(sources))
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # SIGNAL DU JOUR + MÉTRIQUES + FEATURES
+    # ------------------------------------------------------------------
+    col_signal, col_metrics, col_model_info = st.columns([1.5, 1.5, 2])
+
+    with col_signal:
+        st.subheader("Signal du jour")
+        st.caption(f"Basé sur les données du {last_date}")
+
+        if signal == "HAUSSE":
+            st.markdown(f'<p class="signal-up">▲ {signal}</p>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<p class="signal-down">▼ {signal}</p>', unsafe_allow_html=True)
+
+        st.metric("Probabilité de hausse", f"{proba:.1%}")
+        st.metric("Seuil appliqué",        f"{seuil:.0%}")
+
+    with col_metrics:
+        st.subheader("Performance modèle")
+        m = meta["metrics"]
+        st.metric("Accuracy", f"{m['acc']:.1%}")
+        st.metric("AUC",      f"{m['auc']:.3f}")
+        st.metric("F1-score", f"{m['f1']:.3f}")
+
+    with col_model_info:
+        st.subheader("Features utilisées")
+        lag_data = [
+            {"Feature": feat, "Lag (jours)": lag, "Col. modèle": f"{feat}_lag{lag}"}
+            for feat, lag in best_lags.items()
+        ]
+        st.dataframe(pd.DataFrame(lag_data), hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # GRAPHIQUES
+    # ------------------------------------------------------------------
+    tab1, tab2 = st.tabs(["📊 Prix & Probabilités", "📋 Données brutes"])
+
+    with tab1:
+        df_probas = render_price_probability_chart(asset, asset_label, data, seuil)
+        n_hausse = (df_probas["proba"] >= seuil).sum()
+        st.caption(
+            f"🟢 **{n_hausse} signaux HAUSSE** sur {len(df_probas)} jours  |  "
+            f"Barres vertes = proba ≥ seuil ({seuil:.0%})  |  "
+            f"Barres rouges = proba < seuil"
+        )
+
+    with tab2:
+        st.caption("Dernières valeurs des features (avec lags appliqués)")
+        st.dataframe(
+            features_df.tail(20).style.format("{:.6f}"),
+            use_container_width=True,
+        )
+
+    # ------------------------------------------------------------------
+    # FOOTER
+    # ------------------------------------------------------------------
+    st.divider()
+    st.caption(
+        "⚠️ **Avertissement** : Ces prédictions sont issues d'un modèle académique "
+        "et ne constituent pas des conseils en investissement."
+    )
+
+
+# =============================================================================
+# ROUTAGE PRINCIPAL
 # =============================================================================
 
 def main():
-    # ------------------------------------------------------------------
-    # Config page
-    # ------------------------------------------------------------------
     st.set_page_config(
         page_title  = "Prédiction Marchés — Jedha",
         page_icon   = "📈",
         layout      = "wide",
-        initial_sidebar_state = "expanded",
+        initial_sidebar_state = "collapsed",
     )
 
     # CSS minimal
@@ -237,264 +653,28 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # ------------------------------------------------------------------
-    # Sidebar
-    # ------------------------------------------------------------------
-    st.sidebar.title("⚙️ Paramètres")
+    # Initialisation de la page courante
+    if "page" not in st.session_state:
+        st.session_state.page = "public"
 
-    asset_label = st.sidebar.selectbox("Actif", list(ASSETS.keys()))
-    asset       = ASSETS[asset_label]
+    # Bouton de navigation en haut à droite
+    col_nav1, col_nav2 = st.columns([6, 1])
+    with col_nav2:
+        if st.session_state.page == "public":
+            if st.button("⚙️ Paramètres", use_container_width=True):
+                st.session_state.page = "settings"
+                st.rerun()
+        else:
+            if st.button("⬅️ Retour", use_container_width=True):
+                st.session_state.page = "public"
+                st.rerun()
 
-    # Modèle optimal affiché automatiquement (pas de sélecteur)
-    best_model_info = BEST_MODEL_BY_ASSET[asset]
-    model_label     = best_model_info["label"]
-    model_key       = best_model_info["key"]
-
-    st.sidebar.markdown(f"**Modèle retenu** : {model_label}")
-    st.sidebar.caption("Sélection basée sur AUC et F1 out-of-sample")
-
-    seuil = st.sidebar.slider(
-        "Seuil de décision",
-        min_value = 0.30,
-        max_value = 0.70,
-        value     = 0.40,
-        step      = 0.05,
-        help      = "Probabilité minimale pour déclencher un signal HAUSSE"
-    )
-
-    st.sidebar.markdown("---")
-
-    # Saisie manuelle CLI
-    st.sidebar.markdown("**📊 CLI — Saisie manuelle**")
-    st.sidebar.caption("Renseigner les deux dernières valeurs mensuelles connues (source : OCDE)")
-    cli_prev  = st.sidebar.number_input(
-        "CLI mois M-1",
-        value   = 100.0,
-        step    = 0.01,
-        format  = "%.4f",
-        help    = "Valeur CLI du mois précédent"
-    )
-    cli_curr  = st.sidebar.number_input(
-        "CLI mois M (dernier connu)",
-        value   = 100.0,
-        step    = 0.01,
-        format  = "%.4f",
-        help    = "Valeur CLI du mois en cours"
-    )
-    cli_diff  = round(cli_curr - cli_prev, 6)
-    st.sidebar.metric("CLI_Diff calculé", f"{cli_diff:+.4f}")
-
-    st.sidebar.markdown("---")
-
-    # Tableau récapitulatif des meilleurs modèles
-    st.sidebar.markdown("**Meilleurs modèles par actif**")
-    df_best = pd.DataFrame([
-        {"Actif": k, "Modèle": v["label"], "AUC": v["auc"], "F1": v["f1"]}
-        for k, v in BEST_MODEL_BY_ASSET.items()
-    ])
-    st.sidebar.dataframe(df_best, hide_index=True, use_container_width=True)
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**À propos**")
-    st.sidebar.markdown(
-        "Projet Jedha — Impact des variations du prix du pétrole "
-        "sur les marchés financiers (AF, TTE, RNO)."
-    )
-
-    # ------------------------------------------------------------------
-    # Chargement
-    # ------------------------------------------------------------------
-    metadata = load_metadata()
-    if metadata is None:
-        st.error(
-            "⚠️ Fichier `outputs/models/metadata.json` introuvable. "
-            "Lance d'abord `python3 multi_asset_experiment.py` pour générer les modèles."
-        )
-        return
-
-    model = load_model(asset, model_key)
-    if model is None:
-        st.error(f"⚠️ Modèle introuvable pour {asset} / {model_label}. Vérifiez `outputs/models/`.")
-        return
-
-    meta      = metadata[asset]
-    best_lags = meta["best_lags"]
-
-    # ------------------------------------------------------------------
-    # Données live
-    # ------------------------------------------------------------------
-    with st.spinner("Chargement des données de marché..."):
-        try:
-            prices, returns = load_live_prices(days=90)
-            data_ok = True
-        except Exception as e:
-            st.warning(f"Impossible de télécharger les données live : {e}")
-            data_ok = False
-
-    # GPR — téléchargement indépendant (peut échouer sans bloquer l'app)
-    with st.spinner("Chargement GPR (Caldara & Iacoviello)..."):
-        df_gpr = load_gpr_live()
-    gpr_ok = df_gpr is not None
-
-    # ------------------------------------------------------------------
-    # TITRE
-    # ------------------------------------------------------------------
-    st.title(f"📈 Prédiction — {asset_label}")
-
-    # Statut des sources de données
-    sources = []
-    sources.append("✅ Yahoo Finance (STOXX, VIX, Brent)")
-    sources.append("✅ GPR live — data_gpr_daily_recent.xls (Caldara & Iacoviello)" if gpr_ok else "⚠️ GPR indisponible → fixé à 0")
-    sources.append(f"✅ CLI saisi manuellement (diff = {cli_diff:+.4f})" if cli_diff != 0.0 else "⚠️ CLI_Diff = 0 (non renseigné)")
-    st.caption(f"Modèle : **{model_label}**  |  Seuil : **{seuil}**  |  " + "  |  ".join(sources))
-    st.divider()
-
-    # ------------------------------------------------------------------
-    # SIGNAL DU JOUR
-    # ------------------------------------------------------------------
-    col_signal, col_metrics, col_model_info = st.columns([1.5, 1.5, 2])
-
-    if data_ok:
-        features_df = build_live_features(returns, best_lags, df_gpr=df_gpr, cli_diff=cli_diff)
-
-        if len(features_df) == 0:
-            st.error("Pas assez de données pour calculer les features.")
-            return
-
-        feature_cols = list(features_df.columns)
-        last_row     = features_df.iloc[[-1]][feature_cols]
-        proba        = model.predict_proba(last_row)[0][1]
-        signal       = "HAUSSE" if proba >= seuil else "BAISSE"
-        last_date    = features_df.index[-1].strftime("%d/%m/%Y")
-
-        with col_signal:
-            st.subheader("Signal du jour")
-            st.caption(f"Basé sur les données du {last_date}")
-
-            if signal == "HAUSSE":
-                st.markdown(f'<p class="signal-up">▲ {signal}</p>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<p class="signal-down">▼ {signal}</p>', unsafe_allow_html=True)
-
-            st.metric("Probabilité de hausse", f"{proba:.1%}")
-            st.metric("Seuil appliqué",        f"{seuil:.0%}")
-
-        with col_metrics:
-            st.subheader("Performance modèle")
-            m = meta["metrics"]
-            st.metric("Accuracy", f"{m['acc']:.1%}")
-            st.metric("AUC",      f"{m['auc']:.3f}")
-            st.metric("F1-score", f"{m['f1']:.3f}")
-
-        with col_model_info:
-            st.subheader("Features utilisées")
-            lag_data = [
-                {"Feature": feat, "Lag (jours)": lag, "Col. modèle": f"{feat}_lag{lag}"}
-                for feat, lag in best_lags.items()
-            ]
-            st.dataframe(pd.DataFrame(lag_data), hide_index=True, use_container_width=True)
-
-    st.divider()
-
-    # ------------------------------------------------------------------
-    # GRAPHIQUES
-    # ------------------------------------------------------------------
-    if data_ok:
-        tab1, tab2 = st.tabs(["📊 Prix & Probabilités", "📋 Données brutes"])
-
-        # TAB 1 — Graphique combiné prix + probabilités (axe double)
-        with tab1:
-            asset_ticker_map = {"AF": "AF", "TTE": "TTE", "RNO": "RNO"}
-            yf_col = asset_ticker_map.get(asset, asset)
-
-            # Calcul des probabilités sur les 30 derniers jours
-            n_days = min(30, len(features_df))
-            probas = []
-            for i in range(n_days):
-                idx = -(n_days - i)
-                row = features_df.iloc[idx][feature_cols]
-                p   = model.predict_proba(row.values.reshape(1, -1))[0][1]
-                probas.append({"date": features_df.index[idx], "proba": p})
-            df_probas = pd.DataFrame(probas).set_index("date")
-
-            # Aligner les prix sur les 30 derniers jours des probabilités
-            if yf_col in prices.columns:
-                prix_30 = prices[yf_col].reindex(df_probas.index, method="ffill").dropna()
-                dates   = prix_30.index
-
-                fig, ax1 = plt.subplots(figsize=(13, 5))
-                fig.patch.set_facecolor("#1e2530")
-                ax1.set_facecolor("#1e2530")
-
-                # Axe gauche — Prix
-                ax1.plot(dates, prix_30.values, color="#4fc3f7",
-                         linewidth=2, label=f"Prix {asset}", zorder=3)
-                ax1.fill_between(dates, prix_30.values, prix_30.min(),
-                                 alpha=0.08, color="#4fc3f7")
-                ax1.set_ylabel("Prix (€)", color="#4fc3f7", fontsize=11)
-                ax1.tick_params(axis="y", colors="#4fc3f7")
-                ax1.tick_params(axis="x", colors="white")
-                ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-                plt.xticks(rotation=30)
-                for spine in ax1.spines.values():
-                    spine.set_edgecolor("#333")
-
-                # Axe droit — Probabilités
-                ax2 = ax1.twinx()
-                probas_aligned = df_probas["proba"].reindex(dates, method="ffill")
-                colors_bar = ["#4caf50" if p >= seuil else "#ef5350"
-                              for p in probas_aligned.values]
-
-                ax2.bar(dates, probas_aligned.values, color=colors_bar,
-                        alpha=0.45, width=0.8, label="Proba hausse", zorder=2)
-                ax2.axhline(seuil, color="white", linestyle="--",
-                            linewidth=1.2, label=f"Seuil ({seuil:.0%})", zorder=4)
-                ax2.set_ylabel("Probabilité de hausse", color="white", fontsize=11)
-                ax2.tick_params(axis="y", colors="white")
-                ax2.set_ylim(0, 1.4)   # espace pour ne pas écraser la courbe prix
-
-                # Légende unifiée
-                lines1, labels1 = ax1.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax1.legend(lines1 + lines2, labels1 + labels2,
-                           facecolor="#1e2530", labelcolor="white",
-                           loc="upper left", fontsize=9)
-
-                ax1.set_title(
-                    f"{asset_label} — Prix de clôture & Probabilité de hausse (30 derniers jours)",
-                    fontsize=12, color="white", pad=12,
-                )
-
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close()
-
-                # Résumé sous le graphique
-                n_hausse = (df_probas["proba"] >= seuil).sum()
-                st.caption(
-                    f"🟢 **{n_hausse} signaux HAUSSE** sur {len(df_probas)} jours  |  "
-                    f"Barres vertes = proba ≥ seuil ({seuil:.0%})  |  "
-                    f"Barres rouges = proba < seuil"
-                )
-
-        # TAB 2 — Données brutes
-        with tab2:
-            st.caption("Dernières valeurs des features (avec lags appliqués)")
-            st.dataframe(
-                features_df.tail(20).style.format("{:.6f}"),
-                use_container_width=True,
-            )
-
-    # ------------------------------------------------------------------
-    # FOOTER
-    # ------------------------------------------------------------------
-    st.divider()
-    st.caption(
-        "⚠️ **Avertissement** : Ces prédictions sont issues d'un modèle académique "
-        "et ne constituent pas des conseils en investissement. "
-        "Les features GPR et CLI ne sont pas disponibles en temps réel — "
-        "leurs valeurs sont fixées à 0 dans le mode live."
-    )
+    # Affichage de la page sélectionnée
+    if st.session_state.page == "public":
+        st.sidebar.empty()  # masque la sidebar sur la page publique
+        render_public_page()
+    else:
+        render_settings_page()
 
 
 if __name__ == "__main__":
