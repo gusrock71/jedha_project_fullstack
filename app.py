@@ -100,19 +100,22 @@ def load_live_prices(days: int = 60):
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
     raw.rename(columns=TICKERS_LIVE, inplace=True)
 
-    # Log-returns
-    returns = np.log(raw / raw.shift(1)).dropna()
+    # Comble les trous ponctuels (ex: jour férié sur un seul marché)
+    raw = raw.ffill().bfill()
+
+    # Log-returns — dropna uniquement sur les lignes entièrement vides
+    returns = np.log(raw / raw.shift(1)).dropna(how="all")
     return raw, returns
 
 
 @st.cache_data(ttl=86400)   # cache 24h — données mises à jour mensuellement
 def load_gpr_live() -> pd.DataFrame | None:
     """
-    Charge le GPR journalier avec la priorité suivante :
+    Charge le GPR journalier depuis matteoiacoviello.com :
       1. data_gpr_daily_recent.xls  (journalier — référence)
       2. data_gpr_export.xls        (mensuel — fallback distant)
-      3. data_gpr_daily_recent_.csv (fichier local — fallback final)
     Colonnes source : GPRA → GPRD_ACT / GPRT → GPRD_THREAT.
+    Retourne None si les deux téléchargements échouent (features GPR fixées à 0).
     """
     import requests, io
 
@@ -120,7 +123,6 @@ def load_gpr_live() -> pd.DataFrame | None:
         "https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.xls",
         "https://www.matteoiacoviello.com/gpr_files/data_gpr_export.xls",
     ]
-    GPR_LOCAL = "data/raw/data_gpr_daily_recent_.csv"
 
     def parse_xls(content: bytes) -> pd.DataFrame:
         df = pd.read_excel(io.BytesIO(content), engine="xlrd")
@@ -140,7 +142,6 @@ def load_gpr_live() -> pd.DataFrame | None:
         df["GPRD_THREAT_Diff"] = df["GPRD_THREAT"].diff().fillna(0)
         return df[["GPRD_ACT_Diff", "GPRD_THREAT_Diff"]]
 
-    # --- Tentatives distantes ---
     for url in URLS:
         try:
             resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -149,18 +150,7 @@ def load_gpr_live() -> pd.DataFrame | None:
         except Exception:
             continue
 
-    # --- Fallback fichier local CSV ---
-    try:
-        df = pd.read_csv(GPR_LOCAL)
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").set_index("date")
-        df["GPRD_ACT"]    = pd.to_numeric(df.get("GPRD_ACT",    df.get("GPRA")),    errors="coerce")
-        df["GPRD_THREAT"] = pd.to_numeric(df.get("GPRD_THREAT", df.get("GPRT")),    errors="coerce")
-        df["GPRD_ACT_Diff"]    = df["GPRD_ACT"].diff().fillna(0)
-        df["GPRD_THREAT_Diff"] = df["GPRD_THREAT"].diff().fillna(0)
-        return df[["GPRD_ACT_Diff", "GPRD_THREAT_Diff"]]
-    except Exception:
-        return None
+    return None
 
 
 @st.cache_data(ttl=86400)   # cache 24h — données mensuelles
@@ -303,6 +293,18 @@ def load_common_data(asset: str, seuil: float, cli_diff: float = 0.0):
     features_df = build_live_features(returns, best_lags, df_gpr=df_gpr, cli_diff=cli_diff)
     if len(features_df) == 0:
         st.error("Pas assez de données pour calculer les features.")
+
+        with st.expander("🔍 Diagnostic"):
+            st.write("**Shape `returns`** :", returns.shape if returns is not None else None)
+            st.write("**Colonnes `returns`** :", list(returns.columns) if returns is not None else None)
+            if returns is not None:
+                st.write("**Valeurs manquantes par colonne** :")
+                st.write(returns.isna().sum())
+                st.write("**Dernières lignes de `returns`** :")
+                st.dataframe(returns.tail(10))
+            st.write("**best_lags** :", best_lags)
+            st.write("**GPR disponible** :", gpr_ok)
+
         return None
 
     feature_cols = list(features_df.columns)

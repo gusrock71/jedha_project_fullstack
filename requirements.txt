@@ -1,8 +1,10 @@
+streamlit
 numpy
 pandas
 yfinance
 matplotlib
-seaborn
-scipy
-statsmodels
 scikit-learn
+xgboost
+joblib
+xlrd
+EOF
