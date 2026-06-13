@@ -2,79 +2,79 @@
   "AF": {
     "target": "AF_Return",
     "best_lags": {
-      "GPRD_ACT_Diff": 3,
+      "GPRD_ACT_Diff": 2,
       "GPRD_THREAT_Diff": 2,
-      "CLI_Diff": 9,
+      "CLI_Diff": 30,
       "STOXX_Return": 0,
       "VIX_Return": 0,
       "Brent_Return": 0
     },
     "features": [
-      "GPRD_ACT_Diff_lag3",
+      "GPRD_ACT_Diff_lag2",
       "GPRD_THREAT_Diff_lag2",
-      "CLI_Diff_lag9",
+      "CLI_Diff_lag30",
       "STOXX_Return_lag0",
       "VIX_Return_lag0",
       "Brent_Return_lag0"
     ],
     "metrics": {
-      "acc": 0.7051,
-      "auc": 0.8211,
-      "f1": 0.6807,
-      "prec": 0.5469,
-      "rec": 0.901
+      "acc": 0.612,
+      "auc": 0.6684,
+      "f1": 0.6761,
+      "prec": 0.5793,
+      "rec": 0.8116
     }
   },
   "TTE": {
     "target": "TTE_Return",
     "best_lags": {
-      "GPRD_ACT_Diff": 13,
-      "GPRD_THREAT_Diff": 27,
-      "CLI_Diff": 8,
+      "GPRD_ACT_Diff": 5,
+      "GPRD_THREAT_Diff": 25,
+      "CLI_Diff": 7,
       "STOXX_Return": 0,
       "VIX_Return": 0,
       "Brent_Return": 0
     },
     "features": [
-      "GPRD_ACT_Diff_lag13",
-      "GPRD_THREAT_Diff_lag27",
-      "CLI_Diff_lag8",
+      "GPRD_ACT_Diff_lag5",
+      "GPRD_THREAT_Diff_lag25",
+      "CLI_Diff_lag7",
       "STOXX_Return_lag0",
       "VIX_Return_lag0",
       "Brent_Return_lag0"
     ],
     "metrics": {
-      "acc": 0.7591,
-      "auc": 0.8534,
-      "f1": 0.7287,
-      "prec": 0.6432,
-      "rec": 0.8403
+      "acc": 0.6699,
+      "auc": 0.7205,
+      "f1": 0.7175,
+      "prec": 0.6784,
+      "rec": 0.7615
     }
   },
   "RNO": {
     "target": "RNO_Return",
     "best_lags": {
-      "GPRD_ACT_Diff": 7,
-      "GPRD_THREAT_Diff": 11,
-      "CLI_Diff": 14,
+      "GPRD_ACT_Diff": 30,
+      "GPRD_THREAT_Diff": 7,
+      "CLI_Diff": 15,
       "STOXX_Return": 0,
       "VIX_Return": 0,
       "Brent_Return": 0
     },
     "features": [
-      "GPRD_ACT_Diff_lag7",
-      "GPRD_THREAT_Diff_lag11",
-      "CLI_Diff_lag14",
+      "GPRD_ACT_Diff_lag30",
+      "GPRD_THREAT_Diff_lag7",
+      "CLI_Diff_lag15",
       "STOXX_Return_lag0",
       "VIX_Return_lag0",
       "Brent_Return_lag0"
     ],
     "metrics": {
-      "acc": 0.7481,
-      "auc": 0.8499,
-      "f1": 0.7187,
-      "prec": 0.6083,
-      "rec": 0.8782
+      "acc": 0.6518,
+      "auc": 0.7027,
+      "f1": 0.6999,
+      "prec": 0.6383,
+      "rec": 0.7747
     }
   }
 }

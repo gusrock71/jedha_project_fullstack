@@ -11,6 +11,7 @@ from src.config import (
     GPR_CSV, CLI_CSV,
     START_DATE, END_DATE,
 )
+from src.trading_calendar import filter_to_trading_days
 
 
 # -----------------------------------------------------------------------------
@@ -228,7 +229,8 @@ def load_cli(df_combined: pd.DataFrame) -> pd.DataFrame:
 def build_dataset() -> pd.DataFrame:
     """
     Orchestre l'ensemble des chargements et retourne df_combined prêt à l'emploi,
-    filtré sur la fenêtre d'analyse et sans valeurs manquantes.
+    filtré sur la fenêtre d'analyse, sur le calendrier de cotation Euronext Paris,
+    et sans valeurs manquantes.
     """
     from src.config import ANALYSIS_START, ANALYSIS_END
 
@@ -239,6 +241,14 @@ def build_dataset() -> pd.DataFrame:
 
     # Fenêtre retenue
     df = df.loc[ANALYSIS_START:ANALYSIS_END]
+
+    # Filtrage sur le calendrier de cotation Euronext Paris : retire les
+    # week-ends et les jours fériés français pendant lesquels d'autres
+    # marchés (STOXX, VIX, Brent...) ont coté — ces lignes ne contiennent
+    # que des valeurs ré-échantillonnées (ffill) côté AF/TTE/RNO et
+    # n'apportent aucun signal réel.
+    df = filter_to_trading_days(df)
+
     df = df.fillna(0)
 
     print(f"\nDataset final : {df.shape[0]} lignes × {df.shape[1]} colonnes")
